@@ -1,0 +1,7 @@
+HighTaxi Chess v0.9.32
+Stockfish is loaded directly as a Web Worker from the root file:
+  stockfish-18-lite-single.js
+The WASM file is passed in the Worker URL hash:
+  stockfish-18-lite-single.wasm
+This removes the intermediate importScripts bootstrap that could leave
+the engine silent on iOS Safari / GitHub Pages.

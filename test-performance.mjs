@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const app=fs.readFileSync('./app.js','utf8');
+const tree=fs.readFileSync('./src/games/tree.js','utf8');
+assert.match(tree,/const openingPrefixCache=new Map\(\)/);
+assert.match(tree,/function openingPrefixForGame\(game,maxPlies\)/);
+assert.match(tree,/openingPrefixCache\.get\(id\)/);
+assert.doesNotMatch(app,/JSON\.stringify\(g\.analysisTree\)\.length/);
+assert.match(app,/function renderArrowsForPosition\(fen,engineBest=null\)/);
+assert.match(app,/getArrowCacheKey/);
+assert.match(app,/setCachedArrows/);
+assert.doesNotMatch(tree,/renderBoard\(/);
+assert.doesNotMatch(tree,/renderMoves\(/);
+assert.match(app,/let gameSearch="",gameSearchTimer=null,gameResultFilter="all",gameColorFilter="all",gameSourceFilter="all",gameRenderLimit=100/);
+assert.match(app,/const visible=a\.slice\(0,gameRenderLimit\)/);
+assert.match(app,/more\.className="loadMoreGames"/);
+assert.match(app,/gameRenderLimit\+=100/);
+console.log('PERFORMANCE/CACHE/PAGINATION TESTS OK');

@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import {getArrowCacheKey,setCachedArrows,getCachedArrows,clearArrowCache,arrowCacheSize} from './src/analysis/cache.js';
+clearArrowCache();
+const base={positionKey:'fen',dataRevision:1,sideFilter:'w',annotationRevision:2,engineRevision:3};
+const a=getArrowCacheKey(base),b=getArrowCacheKey({...base,annotationRevision:3});
+assert.notEqual(a,b);
+const arrows=[Object.freeze({from:'e2',to:'e4'})];
+setCachedArrows(a,arrows);
+const cached=getCachedArrows(a);
+assert.ok(cached);
+assert.notStrictEqual(cached,arrows,'cache must own its derived-data container');
+assert.ok(Object.isFrozen(cached));
+assert.ok(Object.isFrozen(cached[0]));
+assert.equal(arrowCacheSize(),1);
+console.log('ARROW CACHE TESTS OK');
