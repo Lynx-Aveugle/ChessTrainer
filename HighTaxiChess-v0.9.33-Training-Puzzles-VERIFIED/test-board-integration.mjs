@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const app=fs.readFileSync('./app.js','utf8');
+assert.match(app,/function renderArrowsForPosition\(fen,engineBest=null\)/);
+assert.match(app,/createArrowRenderer\(board/);
+assert.match(app,/positionNavigator\.navigateByMove\(move\)/);
+assert.doesNotMatch(app,/board\.querySelector\("\.moveArrows"\)\?\.remove\(\)/);
+assert.match(app,/renderArrowsForPosition\(state.currentNode\.fen,null\)/);
+assert.match(app,/result\.bestMove/);
+console.log('BOARD INTEGRATION TESTS OK');
