@@ -5,8 +5,8 @@ const app=fs.readFileSync("./app.js","utf8");
 const version=fs.readFileSync("./version.js","utf8");
 const sw=fs.readFileSync("./sw.js","utf8");
 
-assert.match(version,/APP_VERSION="0\.9\.33"/);
-assert.match(sw,/v0\.9\.33/);
+const versionMatch=version.match(/APP_VERSION="([^\"]+)"/); assert.ok(versionMatch);
+assert.match(sw,new RegExp(`v${versionMatch[1].replace(/\./g,"\\.")}`));
 
 const openStart=app.indexOf("async function openGame(id)");
 const openEnd=app.indexOf("let boardRotated=false;",openStart);

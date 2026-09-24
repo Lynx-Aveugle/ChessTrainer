@@ -11,6 +11,8 @@ assert.doesNotMatch(app,/\{\.\.\.activeGame[,}]/,'Persistence must use state.act
 assert.doesNotMatch(app,/\[\.\.\.currentNode\.annotations\]/,'Annotation toggle must read state.currentNode');
 assert.match(app,/type:"application\/x-chess-pgn"/,'PGN export must keep the correct MIME type');
 assert.match(app,/globalAnnotations:state\.globalMoveAnnotations/,'Global tree must receive the persisted annotation map');
+assert.match(app,/getEffectiveAnnotations\(state\.currentNode,state\.globalMoveAnnotations\)/,'Board annotations must merge local and global position annotations');
+assert.match(app,/setGlobalAnnotation\(state\.globalMoveAnnotations,state\.currentNode\.parent\.fen,state\.currentNode\.move/,'Annotation toggle must update the shared position index');
 assert.match(app,/state\.globalTreePendingFilter!==\(state\.globalTree\?\._filter\)/,'Pending scope must compare against the current tree filter');
 console.log('STATE WIRING TESTS OK');
 

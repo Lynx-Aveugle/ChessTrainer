@@ -14,8 +14,10 @@ if (!app.includes('base.hash=`${encodeURIComponent(new URL("./stockfish-18-lite-
 if (!fs.readFileSync(root + 'src/analysis/stockfish.js','utf8').includes('postMessage(`position fen ${next.fen}`)')) throw new Error('position command missing');
 if (!fs.readFileSync(root + 'src/analysis/stockfish.js','utf8').includes('postMessage(`go depth ${depth}`)')) throw new Error('go command missing');
 
-if (!sw.includes('isStockfish&&cached')) throw new Error('Stockfish cache-first path missing');
-if (!/APP_VERSION="0\.9\.33"/.test(version)) throw new Error('version must be 0.9.33');
+if (!sw.includes('const refresh=cachePromise.then(cache=>fetch(e.request)')) throw new Error('Service Worker refresh path missing');
+if (!sw.includes('if(cached)return cached;')) throw new Error('Service Worker cache-first path missing');
+const versionMatch=version.match(/APP_VERSION=\"([^\"]+)/);
+if(!versionMatch)throw new Error('APP_VERSION missing');
 
 const js = fs.readFileSync(root + 'stockfish-18-lite-single.js');
 const wasm = fs.readFileSync(root + 'stockfish-18-lite-single.wasm');
@@ -23,5 +25,5 @@ const sha = b => crypto.createHash('sha256').update(b).digest('hex');
 if (js.length !== 20670 || sha(js) !== '2278005057f381491f1c9bb3e44c9f5920b3a00bef9759e33cc6582769a1f1fe') throw new Error('Stockfish JS integrity mismatch');
 if (wasm.length !== 7295411 || sha(wasm) !== 'a8fbc05ec6920b56d7485826dcb02c5ffd2826bcbf751cf973046f237a9096f1') throw new Error('Stockfish WASM integrity mismatch');
 
-console.log('STOCKFISH 0.9.33 REGRESSION TESTS OK');
+console.log(`STOCKFISH ${versionMatch[1]} REGRESSION TESTS OK`);
 console.log('NOTE: this test validates the exact Worker message contract and assets; browser execution still requires a real browser runtime.');

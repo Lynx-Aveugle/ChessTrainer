@@ -4,7 +4,11 @@ export function createTrainingController({state,getGames,currentUser,analyzeFen,
   let abortController=null;
 
   function active(){return !!abortController;}
-  function stop(){abortController?.abort();}
+  function stop(){
+    if(!abortController)return;
+    abortController.abort();
+    cancelEngineAnalysis?.("Scan d’entraînement arrêté…");
+  }
 
   async function scan(){
     if(abortController)return;
@@ -27,13 +31,13 @@ export function createTrainingController({state,getGames,currentUser,analyzeFen,
         }});
         found.push(...puzzles);
         state.trainingPuzzles=[...found];
-        render();
+        if(i===0||(i+1)%8===0||i===games.length-1)render();
       }
       state.trainingPuzzles=[...found];
       save();
       toast(signal.aborted?`Scan arrêté · ${found.length} puzzle(s) conservé(s)`:`Scan terminé · ${found.length} puzzle(s) trouvé(s)`);
     }catch(error){
-      if(error?.name==='AbortError')toast(`Scan arrêté · ${found.length} puzzle(s) conservé(s)`);
+      if(signal.aborted||error?.name==='AbortError')toast(`Scan arrêté · ${found.length} puzzle(s) conservé(s)`);
       else toast('Analyse d’entraînement impossible : '+(error?.message||error));
     }finally{
       abortController=null;
@@ -44,7 +48,7 @@ export function createTrainingController({state,getGames,currentUser,analyzeFen,
     }
   }
 
-  function save(){try{localStorage.setItem('ht_training_puzzles_v1',JSON.stringify(state.trainingPuzzles||[]));return true}catch{return false}}
+  function save(){try{localStorage.setItem('ht_training_puzzles_v1',JSON.stringify(state.trainingPuzzles||[]));state.trainingPuzzlesRevision=Number(state.trainingPuzzlesRevision||0)+1;return true}catch{return false}}
 
   function exportFile(){
     const puzzles=Array.isArray(state.trainingPuzzles)?state.trainingPuzzles:[];

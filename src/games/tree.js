@@ -1,6 +1,7 @@
 import {openingLineUltraFast} from '../../pgn.js';
 import {positionKeyFromFen} from '../chess/position.js';
 import {classifyAnnotations,mergeAnnotationCounts} from '../analysis/classification.js';
+import {getStoredGlobalAnnotations} from '../analysis/annotations.js';
 
 function userSide(game,user='HighTaxi'){
   const target=String(user||'').trim().toLowerCase();
@@ -11,6 +12,7 @@ function userSide(game,user='HighTaxi'){
 function resultBucket(result){return result==='1-0'?'white':result==='0-1'?'black':result==='1/2-1/2'?'draw':null}
 function annotationsForStep(analysisNode,san){return analysisNode?.children?.find(n=>n.san===san)||null}
 const openingPrefixCache=new Map();
+export function clearOpeningPrefixCache(){openingPrefixCache.clear();}
 function openingPrefixForGame(game,maxPlies){
   const id=String(game?.id||'');const key=String(game?.pgn||'');const cached=openingPrefixCache.get(id);
   if(cached?.key===key&&cached.maxPlies===maxPlies)return cached.value;
@@ -47,9 +49,7 @@ export function buildGlobalTree(games,{maxPlies=24,sideFilter='all',user='HighTa
         seenEdges.add(edgeKey);edge.count++;if(bucket)edge.stats[bucket]++;
         const turn=String(step.from||'').split(/\s+/)[1]||'';if((turn==='w'&&userSide(game,user)==='w')||(turn==='b'&&userSide(game,user)==='b'))edge.playedByUser++;
         const analysisChild=annotationsForStep(analysisNode,step.san);
-        const globalKey=`${positionKeyFromFen(step.from)}|${moveKey}`;
-        const legacyKey=`${positionKeyFromFen(step.from)}|${step.san}`;
-        const sourceAnnotations=globalAnnotations?.[globalKey]?.annotations||globalAnnotations?.[legacyKey]?.annotations||[];
+        const sourceAnnotations=getStoredGlobalAnnotations(globalAnnotations,step.from,{...move,san:step.san});
         const combinedAnnotations=[...(analysisChild?.annotations||[]),...sourceAnnotations];
         if(combinedAnnotations.length){
           mergeAnnotationCounts(edge.annotations,combinedAnnotations);

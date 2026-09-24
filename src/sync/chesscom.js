@@ -20,4 +20,14 @@ export async function fetchChessComPgn(archiveUrl){
 export function chessComMonthKey(url){const m=String(url).match(/\/games\/(\d{4})\/(\d{2})\/?$/);return m?`${m[1]}/${m[2]}`:String(url);}
 export function chessComPgnIsStandard(headers){const variant=String(headers?.Variant||headers?.Rules||'').trim().toLowerCase();return !variant||variant==='standard'||variant==='chess';}
 export function hashId(text){let h=2166136261;for(let i=0;i<text.length;i++){h^=text.charCodeAt(i);h=Math.imul(h,16777619)}return `pgn-${(h>>>0).toString(16)}-${text.length}`;}
-export function chessComStableId(game,pgn){const raw=String(game?.url||'');const match=raw.match(/\/(?:live|daily|game)\/(\d+)/i);if(match)return `chesscom-${match[1]}`;if(game?.uuid)return `chesscom-${game.uuid}`;return hashId(`Chess.com|${pgn}`);}
+function chessComLinkFromPgn(pgn){const m=String(pgn||'').match(/^\[Link\s+"([^"]+)"\]\s*$/mi);return m?m[1]:'';}
+export function chessComStableId(game,pgn){
+  const candidates=[game?.chessComUrl,game?.url,chessComLinkFromPgn(pgn)];
+  for(const value of candidates){
+    const raw=String(value||'');
+    const match=raw.match(/\/(?:live|daily|game)\/(\d+)/i);
+    if(match)return `chesscom-${match[1]}`;
+  }
+  if(game?.uuid)return `chesscom-${game.uuid}`;
+  return hashId(`Chess.com|${String(pgn||'').trim()}`);
+}

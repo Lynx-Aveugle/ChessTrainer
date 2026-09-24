@@ -6,7 +6,7 @@ const db=fs.readFileSync('./db.js','utf8');
 const pgn=fs.readFileSync('./pgn.js','utf8');
 const index=fs.readFileSync('./index.html','utf8');
 
-assert.match(sw,/CACHE=.*v0\.9\.\d+/,'Service Worker doit être versionné pour invalider l’ancien cache');
+assert.match(sw,/CACHE=.*v0\.10\.4/,'Service Worker doit être versionné pour invalider l’ancien cache');
 assert.match(sw,/Network-first|fresh=await refresh/,'Le shell doit être rafraîchi après un déploiement');
 assert.doesNotMatch(sw,/\/api\//,'Le Service Worker ne doit plus prévoir une route proxy Cloudflare');
 assert.match(app,/return c\.san\(move\)/,'UCI vers SAN doit utiliser Chess.san sans muter la position');

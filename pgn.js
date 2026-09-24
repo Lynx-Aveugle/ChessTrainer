@@ -257,10 +257,9 @@ function ultraChooseMove(chess,token){
     if(piece==='p'&&(target[1]===(p[0]==='w'?'8':'1'))&&!promotion)continue;
     candidates.push({from,to:target,promotion:promotion||null});
   }
-  if(candidates.length===1)return candidates[0];
+  if(candidates.length===1)return chess.isLegal(candidates[0].from,candidates[0].to,candidates[0].promotion)?candidates[0]:null;
   if(candidates.length>1){
-    for(const move of candidates){if(chess.isLegal(move.from,move.to,move.promotion))return move}
-    for(const move of candidates){if(sanCore(chess.san(move))===core)return move}
+    for(const move of candidates){if(chess.isLegal(move.from,move.to,move.promotion)&&sanCore(chess.san(move))===core)return move}
   }
   return null;
 }

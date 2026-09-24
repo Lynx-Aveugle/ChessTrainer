@@ -1,0 +1,34 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+
+const ui=fs.readFileSync('./src/ui/training.js','utf8');
+const session=fs.readFileSync('./src/training/session.js','utf8');
+const app=fs.readFileSync('./app.js','utf8');
+const index=fs.readFileSync('./index.html','utf8');
+const sw=fs.readFileSync('./sw.js','utf8');
+
+assert.match(ui,/createTrainingRenderer/);
+assert.match(ui,/buildTrainingQueue/);
+assert.match(ui,/evaluateTrainingAnswer/);
+assert.match(ui,/analyzeFen/);
+assert.match(ui,/trainingNextBtn/);
+assert.match(ui,/exportButton\.disabled=!puzzles\.length/);
+assert.match(ui,/trainingRotateBtn/);
+assert.match(ui,/getSolvedPositions/);
+assert.match(ui,/markPositionSolved/);
+assert.match(ui,/trainingPositionKind/);
+assert.match(ui,/GAIN/);
+assert.match(ui,/GAFFE/);
+assert.match(ui,/legalMoves/);
+assert.match(session,/positionKeyFromFen/);
+assert.match(session,/maxPlies=24/);
+assert.match(app,/createTrainingRenderer/);
+assert.match(index,/id="trainingStartBtn"/);
+assert.match(index,/id="trainingSessionArea"/);
+assert.match(index,/id="trainingBoard"/);
+assert.match(index,/id="trainingFeedback"/);
+assert.match(index,/id="trainingNextBtn"/);
+assert.match(index,/id="trainingRotateBtn"/);
+assert.match(sw,/src\/ui\/training\.js/);
+assert.match(sw,/src\/training\/session\.js/);
+console.log('TRAINING UI CONTRACT TESTS OK');

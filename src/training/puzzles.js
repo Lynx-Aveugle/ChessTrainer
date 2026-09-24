@@ -7,7 +7,8 @@ export const TRAINING_RULES=Object.freeze({
   missedWinMinLossCp:150,
   blunderMinLossCp:200,
   blunderMaxPlayedCp:100,
-  mateScoreCp:100000
+  mateScoreCp:100000,
+  maxPlies:24
 });
 
 export function evaluationToPlayerCp(evaluation,side){
@@ -59,7 +60,7 @@ export async function scanGameForTrainingPuzzles(game,user,analyze,{signal,onPro
   const parsed=parsePGN(game?.pgn||'')[0];
   if(!parsed?.root)return [];
   let chess=new Chess(parsed.startFen||parsed.root.fen||Chess.START_FEN);
-  const nodes=mainline(parsed.root),puzzles=[];
+  const nodes=mainline(parsed.root).slice(0,Math.max(1,Number(TRAINING_RULES.maxPlies)||24)),puzzles=[];
   let userMoves=0,processed=0;
   for(const node of nodes){
     if(signal?.aborted)throw abortError();
@@ -72,12 +73,19 @@ export async function scanGameForTrainingPuzzles(game,user,analyze,{signal,onPro
       const bestMove=uciToMove(analysis?.bestMove);
       if(signal?.aborted)throw abortError();
       if(bestMove&&!sameMove(bestMove,playedMove)){
-        const bestChess=new Chess(parentFen);const bestResult=bestChess.play(bestMove);
+        const bestChess=new Chess(parentFen);
+        if(!bestChess.isLegal(bestMove.from,bestMove.to,bestMove.promotion)) {
+          chess=new Chess(node.fen);
+          processed++;
+          onProgress?.({processed,total:nodes.length,userMoves,puzzles:puzzles.length,gameId:String(game.id||'')});
+          continue;
+        }
+        const bestResult=bestChess.play(bestMove);
         const playedChess=new Chess(parentFen);const playedResult=playedChess.play(playedMove);
-        const bestAfter=normalizeEngineEvaluation(bestResult.fen,await analyze(bestResult.fen));
+        const bestEvaluation=normalizeEngineEvaluation(parentFen,analysis?.evaluation||{});
+        const playedAfter=normalizeEngineEvaluation(playedResult.fen,(await analyze(playedResult.fen))?.evaluation||{});
         if(signal?.aborted)throw abortError();
-        const playedAfter=normalizeEngineEvaluation(playedResult.fen,await analyze(playedResult.fen));
-        const bestPlayerCp=evaluationToPlayerCp(bestAfter,side),playedPlayerCp=evaluationToPlayerCp(playedAfter,side);
+        const bestPlayerCp=evaluationToPlayerCp(bestEvaluation,side),playedPlayerCp=evaluationToPlayerCp(playedAfter,side);
         const classification=classifyTrainingPosition({bestPlayerCp,playedPlayerCp,bestMove:moveKey(bestMove),playedMove:moveKey(playedMove)});
         if(classification){
           puzzles.push({

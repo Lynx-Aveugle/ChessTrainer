@@ -6,21 +6,24 @@ import {parsePGN,exportPGN,headersFrom,splitGames,openingLineUltraFast} from "./
 import {getAll,put,putMany,remove,clearAll,replaceAll,migrateLegacy,requestPersistence,estimateStorage} from "./db.js";
 import {createStockfishController} from "./src/analysis/stockfish.js";
 import {normalizeEngineEvaluation} from "./src/analysis/evaluation.js";
+import {getEffectiveAnnotations,getStoredGlobalAnnotations,setGlobalAnnotation,mergeGlobalAnnotations} from "./src/analysis/annotations.js";
 import {createNavigator} from "./src/chess/navigation.js";
 import {buildArrowDescriptors} from "./src/analysis/arrows.js";
 import {getArrowCacheKey,getCachedArrows,setCachedArrows,clearArrowCache} from "./src/analysis/cache.js";
 import {createArrowRenderer} from "./src/ui/arrows.js";
 import {createBoardRenderer,renderBoardSquares} from "./src/ui/board.js";
 import {renderMovesList} from "./src/ui/moves.js";
-import {buildGlobalTree as buildGlobalTreePure} from "./src/games/tree.js";
+import {buildGlobalTree as buildGlobalTreePure,clearOpeningPrefixCache} from "./src/games/tree.js";
 import {loadGames as storageLoadGames,saveGame as storageSaveGame,migrateStorage,keepStoragePersistent,getStorageEstimate} from "./src/persistence/storage.js";
+import {validateBackupPayload,migrateBackupGames} from "./src/persistence/backup.js";
 import {CHESSCOM_BASE as SYNC_BASE,chessComMonthKey as syncMonthKey,chessComPgnIsStandard as syncPgnIsStandard,chessComStableId as syncStableId,fetchChessComJson as syncFetchJson,fetchChessComPgn as syncFetchPgn,fetchWithTimeout as syncFetchWithTimeout} from "./src/sync/chesscom.js";
 import {createRouter} from "./src/app/router.js";
 import {runBoot,registerServiceWorker} from "./src/app/lifecycle.js";
-import {state} from "./src/app/state.js";
+import {state,resetUserScopedState} from "./src/app/state.js";
 import {trainingPuzzleKey} from "./src/training/puzzles.js";
+import {createStatisticsRenderer} from "./src/ui/statistics.js";
 import {createTrainingController} from "./src/training/controller.js";
-
+import {createTrainingRenderer} from "./src/ui/training.js";
 const DEFAULT_USER="HighTaxi";
 const ANNOTATION_DEFS=[
   {icon:"!!",label:"Excellent / décisif",kind:"good",nag:3},
@@ -38,12 +41,14 @@ const CHESS_DRAW_RESULTS=new Set(["agreed","stalemate","repetition","insufficien
 const CHESS_SYNC_KEY="ht_chess_sync_archives_v3";
 const CHESS_SYNC_STATUS_KEY="ht_chess_sync_status_v1";
 const TRAINING_PUZZLES_KEY="ht_training_puzzles_v1";
+const TRAINING_SOLVED_KEY="ht_training_solved_v1";
 function loadSyncStatus(){try{return JSON.parse(localStorage.getItem(CHESS_SYNC_STATUS_KEY)||"null")}catch{return null}}
 function saveSyncStatus(status){try{localStorage.setItem(CHESS_SYNC_STATUS_KEY,JSON.stringify(status))}catch{}}
 function renderSyncStatus(){const el=$("syncStatus");if(!el)return;const s=loadSyncStatus();if(!s){el.textContent="Aucune synchronisation effectuée";return}const when=s.at?new Date(s.at).toLocaleString("fr-FR"):"inconnue";el.textContent=`Dernière sync : ${s.ok?"réussie":"échouée"} · ${when}${s.message?` · ${s.message}`:""}`;}
 state.chess=new Chess();
 state.globalMoveAnnotations=loadGlobalMoveAnnotations();
 state.trainingPuzzles=loadTrainingPuzzles();
+state.trainingSolvedPositions=loadTrainingSolvedPositions();
 try{state.appSettings={...state.appSettings,...JSON.parse(localStorage.getItem("ht_settings_v2")||"{}")}}catch{}
 state.appSettings.chesscomUser=String(state.appSettings.chesscomUser||DEFAULT_USER).trim()||DEFAULT_USER;
 let pgnRenderToken=0;
@@ -51,19 +56,11 @@ let persistTimer=null,clubState=null;
 let gameSearch="",gameSearchTimer=null,gameResultFilter="all",gameColorFilter="all",gameSourceFilter="all",gameRenderLimit=100;
 function currentUser(){return state.appSettings.chesscomUser;}
 function saveAppSettings(){try{localStorage.setItem("ht_settings_v2",JSON.stringify(state.appSettings))}catch{}}
-function migrateBackupGames(games,schemaVersion){
-  let out=games.map(g=>({...g}));
-  const from=Math.max(1,Number(schemaVersion||1));
-  if(from<=1)out=out.map(g=>({...g,source:g.source||"PGN",analysisTree:g.analysisTree||null,annotationCount:Number(g.annotationCount||0)}));
-  if(from<=2)out=out.map(g=>({...g,updatedAt:Number(g.updatedAt||((Number(g.timestamp)||0)*1000)||Date.now())}));
-  return out;
-}
-
 
 const $=id=>document.getElementById(id);
 function toast(t){const x=$("toast");x.textContent=t;x.style.display="block";clearTimeout(window._toast);window._toast=setTimeout(()=>x.style.display="none",3200)}
 const appRouter=createRouter({onNavigate(id){
-  if(id!=="boardScreen"&&document.body.classList.contains("analysisActive"))scheduleBackgroundPersist();
+  if(id!=="boardScreen"&&document.body.classList.contains("analysisActive")){saveNoteBeforeNavigation();scheduleBackgroundPersist();}
   document.querySelectorAll(".screen").forEach(s=>s.classList.remove("active"));
   $(id).classList.add("active");
   document.body.classList.toggle("analysisActive",id==="boardScreen");
@@ -112,9 +109,10 @@ function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&l
 function loadGlobalMoveAnnotations(){try{const raw=localStorage.getItem("ht_global_move_annotations_v1");const data=raw?JSON.parse(raw):{};return data&&typeof data==="object"?data:{}}catch{return {}}}
 function saveGlobalMoveAnnotations(){try{localStorage.setItem("ht_global_move_annotations_v1",JSON.stringify(state.globalMoveAnnotations))}catch{}}
 function loadTrainingPuzzles(){try{const data=JSON.parse(localStorage.getItem(TRAINING_PUZZLES_KEY)||"[]");return Array.isArray(data)?data:[]}catch{return []}}
-function saveTrainingPuzzles(){try{localStorage.setItem(TRAINING_PUZZLES_KEY,JSON.stringify(state.trainingPuzzles||[]));return true}catch{return false}}
-function globalMoveKey(parentFen,move){const m=typeof move==="string"?null:move;return `${positionKeyFromFen(parentFen)}|${m?`${m.from}-${m.to}-${m.promotion||""}`:String(move)}`}
-function legacyGlobalMoveKey(parentFen,san){return `${positionKeyFromFen(parentFen)}|${san}`}
+function saveTrainingPuzzles(){try{localStorage.setItem(TRAINING_PUZZLES_KEY,JSON.stringify(state.trainingPuzzles||[]));state.trainingPuzzlesRevision=Number(state.trainingPuzzlesRevision||0)+1;return true}catch{return false}}
+function loadTrainingSolvedPositions(){try{const data=JSON.parse(localStorage.getItem(TRAINING_SOLVED_KEY)||"[]");return Array.isArray(data)?[...new Set(data.map(String))]:[]}catch{return []}}
+function saveTrainingSolvedPositions(){try{localStorage.setItem(TRAINING_SOLVED_KEY,JSON.stringify(state.trainingSolvedPositions||[]));state.dataRevision=Number(state.dataRevision||0)+1;return true}catch{return false}}
+function markTrainingPositionSolved(key){const value=String(key||"");if(!value)return;if(!(state.trainingSolvedPositions||[]).includes(value)){state.trainingSolvedPositions=[...(state.trainingSolvedPositions||[]),value];saveTrainingSolvedPositions();renderTraining();}}
 function annotationKind(a){
   const def=ANNOTATION_DEFS.find(x=>x.icon===a);
   if(def)return def.kind;
@@ -205,15 +203,31 @@ function validateParsedGame(parsed){
 function gameIdentity(source,parsed,headers){return hashId(`${source}|${headers.Link||headers.URL||""}|${headers.White||""}|${headers.Black||""}|${headers.Date||""}|${headers.UTCDate||""}|${headers.UTCTime||""}|${headers.Round||""}|${headers.Result||"*"}|${parsed.startFen||Chess.START_FEN}|${mainlineSignature(parsed.root)}`)}
 function metaFromHeaders(h,source,fallback,pgn,extra={}){return {id:hashId(`${source}|${pgn}`),source,timestamp:parseTimestamp(h,fallback),date:h.Date||"",time:h.UTCTime||"",white:h.White||"?",black:h.Black||"?",result:h.Result||"*",eco:openingName(h.ECO||""),time_control:h.TimeControl||"",event:h.Event||"",site:h.Site||"",round:h.Round||"",pgn,analysisTree:null,annotationCount:0,...extra}}
 function serializeTree(root){
-  function clean(n){return {move:n.move||null,san:n.san||null,fen:n.fen,annotations:[...(n.annotations||[])],comment:n.comment||"",note:n.note||"",clock:n.clock||null,nags:[...(n.nags||[])],children:(n.children||[]).map(clean)}}
+  function clean(n){return {move:n.move||null,san:n.san||null,fen:n.fen,annotations:[...(n.annotations||[])],suppressedAnnotations:[...(n.suppressedAnnotations||[])],comment:n.comment||"",note:n.note||"",clock:n.clock||null,nags:[...(n.nags||[])],children:(n.children||[]).map(clean)}}
   return clean(root)
 }
 function restoreTree(data,parent=null){
-  const n={id:crypto.randomUUID(),parent,children:[],move:data.move||null,san:data.san||null,fen:data.fen,annotations:[...(data.annotations||[])],comment:data.comment||"",note:data.note||"",clock:data.clock||null,nags:[...(data.nags||[])]};
+  const n={id:crypto.randomUUID(),parent,children:[],move:data.move||null,san:data.san||null,fen:data.fen,annotations:[...(data.annotations||[])],suppressedAnnotations:[...(data.suppressedAnnotations||[])],comment:data.comment||"",note:data.note||"",clock:data.clock||null,nags:[...(data.nags||[])]};
   n.children=(data.children||[]).map(c=>restoreTree(c,n));return n;
 }
 function countAnnotations(n){let x=(n.annotations?.length||0)+(n.note?.trim()?1:0);for(const c of n.children||[])x+=countAnnotations(c);return x}
 function findNode(root,id){if(root.id===id)return root;for(const c of root.children||[]){const f=findNode(c,id);if(f)return f}return null}
+function indexPersistedAnnotations(games){
+  for(const game of Array.isArray(games)?games:[]){
+    if(!game?.analysisTree)continue;
+    try{
+      const root=restoreTree(game.analysisTree);
+      const walk=node=>{
+        for(const child of node.children||[]){
+          if(child.move&&child.annotations?.length)for(const icon of new Set(child.annotations))setGlobalAnnotation(state.globalMoveAnnotations,node.fen,child.move,icon,true);
+          walk(child);
+        }
+      };
+      walk(root);
+    }catch{}
+  }
+  saveGlobalMoveAnnotations();
+}
 
 let arrowRenderer=null;
 function buildGlobalTree(){
@@ -270,54 +284,33 @@ function renderGlobalTree(fen){
   const edges=[...node.children.values()].sort((a,b)=>b.count-a.count);
   if(!edges.length){box.innerHTML=`<div class="treeTitle">Aucun coup enregistré depuis cette position.</div>`;return}
   const filterLabel=state.globalTreeSideFilter==="w"?"tes parties avec les Blancs":state.globalTreeSideFilter==="b"?"tes parties avec les Noirs":"toutes tes parties";
-  box.innerHTML=`<div class="analysisScopeTabs" role="tablist"><button class="analysisScopeTab ${state.globalTreeSideFilter==="all"?"active":""}" data-side="all">Toutes</button><button class="analysisScopeTab ${state.globalTreeSideFilter==="w"?"active":""}" data-side="w">HighTaxi Blancs</button><button class="analysisScopeTab ${state.globalTreeSideFilter==="b"?"active":""}" data-side="b">HighTaxi Noirs</button></div><div class="treeTitle">${node.count.toLocaleString("fr-FR")} partie(s) · ${edges.length} prochain(s) coup(s) · ${filterLabel}</div><div class="treeBranches">${edges.map(e=>{const anns=Object.entries(e.annotations||{}).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([a,n])=>`${a}${n>1?`×${n}`:""}`).join(" ");return `<button class="treeBranch" data-fen="${esc(e.node.fen)}" data-game="${esc(e.sampleGameId||"")}"><div class="treeMoveBlock"><span class="treeMove">${esc(e.san)}</span><span class="treeCount">${e.count.toLocaleString("fr-FR")} partie(s)</span>${e.playedByUser?`<span class="treeMine">${e.playedByUser}× par toi</span>`:""}</div>${gaugeMarkup(e.stats,e.count)}<div class="treeAnnotations">${anns||"—"}</div></button>`}).join("")}</div>`;
+  box.innerHTML=`<div class="analysisScopeTabs" role="tablist"><button class="analysisScopeTab ${state.globalTreeSideFilter==="all"?"active":""}" data-side="all">Toutes</button><button class="analysisScopeTab ${state.globalTreeSideFilter==="w"?"active":""}" data-side="w">HighTaxi Blancs</button><button class="analysisScopeTab ${state.globalTreeSideFilter==="b"?"active":""}" data-side="b">HighTaxi Noirs</button></div><div class="treeTitle">${node.count.toLocaleString("fr-FR")} partie(s) · ${edges.length} prochain(s) coup(s) · ${filterLabel}</div><div class="treeBranches">${edges.map(e=>{const anns=Object.entries(e.annotations||{}).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([a,n])=>`${esc(a)}${n>1?`×${n}`:""}`).join(" ");return `<button class="treeBranch" data-fen="${esc(e.node.fen)}" data-game="${esc(e.sampleGameId||"")}"><div class="treeMoveBlock"><span class="treeMove">${esc(e.san)}</span><span class="treeCount">${e.count.toLocaleString("fr-FR")} partie(s)</span>${e.playedByUser?`<span class="treeMine">${e.playedByUser}× par toi</span>`:""}</div>${gaugeMarkup(e.stats,e.count)}<div class="treeAnnotations">${anns||"—"}</div></button>`}).join("")}</div>`;
   box.querySelectorAll(".analysisScopeTab").forEach(b=>b.addEventListener("click",()=>setAnalysisScope(b.dataset.side||"all")));
   box.querySelectorAll(".treeBranch").forEach(b=>b.addEventListener("click",async()=>{renderGlobalTree(b.dataset.fen);if(b.dataset.game){await openGame(b.dataset.game);gotoPositionKey(positionKeyFromFen(b.dataset.fen));}}));
   try{renderArrowsForPosition(fen,null)}catch(err){console.warn("Global arrows disabled for this render",err)}
 }
-
 function invalidateGlobalTree({rebuild=false}={}){state.globalTree=null;state.globalTreeBuiltFor=0;state.globalTreeProgress={done:0,total:0};state.dataRevision++;state.trainingCacheRevision=-1;state.trainingCache=[];pgnRenderToken++;if(rebuild&&document.body.classList.contains("analysisActive"))setTimeout(()=>buildGlobalTree(),0);}
 function renderHome(){
   $("homeGames").textContent=safeGames().length;
   const g=sorted()[0];$("homeLast").textContent=g?`${g.white||"?"} — ${g.black||"?"} · ${g.result||"*"} · ${g.source||"PGN"}`:"Aucune partie";
   const ann=safeGames().reduce((n,g)=>n+(g.annotationCount||0),0);$("homeReview").textContent=ann?`${ann} annotation(s) à revoir`:`Aucune position annotée`;
 }
-function renderStats(){
-  const a=safeGames(),played=a.filter(g=>resultForUser(g)!=="unknown");
-  const wins=played.filter(g=>resultForUser(g)==="win").length,draws=played.filter(g=>resultForUser(g)==="draw").length,losses=played.filter(g=>resultForUser(g)==="loss").length;
-  $("sGames").textContent=a.length;$("sWins").textContent=wins;$("sDraws").textContent=draws;$("sLoss").textContent=losses;
-  const w=a.filter(g=>String(g.white).toLowerCase()===currentUser().toLowerCase()).length,b=a.filter(g=>String(g.black).toLowerCase()===currentUser().toLowerCase()).length;
-  $("sColors").textContent=`Blancs ${w} · Noirs ${b} · Non terminées/inconnues ${a.length-played.length}`;
-  const openings=new Map();for(const g of a){const key=g.eco||"Inconnue";openings.set(key,(openings.get(key)||0)+1)}
-  const top=[...openings.entries()].sort((x,y)=>y[1]-x[1]).slice(0,5),box=$("sOpenings");
-  if(box)box.innerHTML=top.length?top.map(([k,v])=>`<div class="statLine"><span>${esc(k)}</span><b>${v}</b></div>`).join(""):"<span class=\"muted\">Aucune donnée</span>";
-}
+const statisticsRenderer=createStatisticsRenderer({
+  document,
+  getGames:safeGames,
+  getUser:currentUser,
+  getGlobalAnnotations:()=>state.globalMoveAnnotations,
+  getRevision:()=>state.dataRevision,
+  esc,
+  openPosition:async(gameId,fen)=>{await openGame(gameId);gotoPositionKey(positionKeyFromFen(fen));}
+});
+function renderStats(){statisticsRenderer.render();}
+statisticsRenderer.bind();
 const trainingController=createTrainingController({state,getGames:()=>safeGames().filter(g=>userSide(g)),currentUser,analyzeFen:fen=>ensureEngineController().analyze(fen),cancelEngineAnalysis,render:()=>renderTraining(),toast,onPositionChanged});
-function renderTraining(){
-  const box=$("trainingList");if(!box)return;
-  if(state.trainingCacheRevision!==state.dataRevision){
-    const items=[];
-    for(const g of safeGames()){
-      if(!g.analysisTree)continue;
-      try{const root=restoreTree(g.analysisTree);const walk=n=>{for(const c of n.children||[]){if((c.annotations?.length||0)||c.note?.trim())items.push({g,node:c});walk(c)}};walk(root)}catch{}
-    }
-    state.trainingCache=items;state.trainingCacheRevision=state.dataRevision;
-  }
-  const items=state.trainingCache;
-  const puzzles=Array.isArray(state.trainingPuzzles)?state.trainingPuzzles:[];
-  const missed=puzzles.filter(p=>p.type==="missedWin").length;
-  const blunders=puzzles.filter(p=>p.type==="blunder").length;
-  $("trainingText").textContent=(puzzles.length||items.length)?`${puzzles.length} puzzle(s) moteur · ${missed} gain(s) manqué(s) · ${blunders} gaffe(s) · ${items.length} position(s) annotée(s).`:"Aucun puzzle ni position annotée. Lance une analyse moteur pour générer tes puzzles.";
-  const puzzleMarkup=puzzles.slice(0,100).map((p,i)=>`<button class="trainingItem trainingPuzzle ${p.type==="blunder"?"blunder":"missedWin"}" data-game="${esc(p.gameId)}" data-fen="${esc(p.fen)}"><b>#${i+1} · ${p.type==="missedWin"?"Gain manqué":"Gaffe"} · ${esc(p.white)} — ${esc(p.black)}</b><span>${esc(p.side==="w"?"Blancs":"Noirs")} · ${esc(String(p.moveNumber))}${p.side==="b"?"...":"."} ${esc(p.playedSan||"—")} → ${esc(p.bestSan||"—")} · perte ${(Number(p.lossCp||0)/100).toFixed(2)}</span></button>`).join("");
-  const startSection=items.length?`<div class="trainingSectionTitle">Positions annotées</div>`:"";
-  const annotationMarkup=items.slice(0,100).map((x,i)=>`<button class="trainingItem" data-game="${esc(x.g.id)}" data-fen="${esc(x.node.fen)}"><b>Annotation ${i+1} · ${esc(x.g.white||"?")} — ${esc(x.g.black||"?")}</b><span>${esc((x.node.annotations||[]).join(" "))}${x.node.note?.trim()?" · "+esc(x.node.note.trim().slice(0,70)):""}</span></button>`).join("");
-  box.innerHTML=(puzzleMarkup+startSection+annotationMarkup)||'<div class="empty">Aucun élément à revoir.</div>';
-  box.querySelectorAll(".trainingItem").forEach(b=>b.addEventListener("click",async()=>{await openGame(b.dataset.game);gotoPositionKey(positionKeyFromFen(b.dataset.fen));}));
-  const scan=$("trainingScanBtn"),stop=$("trainingStopBtn"),exp=$("trainingExportBtn");
-  if(scan)scan.disabled=trainingController.active();
-  if(stop)stop.hidden=!trainingController.active();
-  if(exp)exp.disabled=!puzzles.length;
-}
+const trainingUI=createTrainingRenderer({document,getGames:safeGames,getPuzzles:()=>state.trainingPuzzles||[],getUser:currentUser,getGlobalAnnotations:()=>state.globalMoveAnnotations,getSolvedPositions:()=>new Set(state.trainingSolvedPositions||[]),markPositionSolved:markTrainingPositionSolved,getRevision:()=>state.dataRevision,getPuzzleRevision:()=>state.trainingPuzzlesRevision||0,isScanActive:()=>trainingController.active(),analyzeFen:fen=>ensureEngineController().analyze(fen),cancelEngineAnalysis,toast,esc,pieceSVG,annotationDef,installPieceFallbacks,openPosition:async(gameId,fen)=>{await openGame(gameId);gotoPositionKey(positionKeyFromFen(fen));}});
+function renderTraining(){trainingUI.render();}
+trainingUI.bind();
+
 function renderGames(){
   const query=gameSearch.trim().toLowerCase();
   const a=sorted().filter(g=>{const hay=[g.white,g.black,g.eco,g.date,g.event,g.source,g.time_control].join(" ").toLowerCase();const result=gameResultFilter==="all"||resultForUser(g)===gameResultFilter;const color=gameColorFilter==="all"||userSide(g)===gameColorFilter;const source=gameSourceFilter==="all"||String(g.source||"").toLowerCase()===gameSourceFilter;return(!query||hay.includes(query))&&result&&color&&source});
@@ -344,7 +337,7 @@ async function openGame(id){
   try{
     const parsed=parsePGN(g.pgn||"")[0];
     if(!parsed)throw new Error("PGN inexploitable");
-    const tree=g.analysisTree?restoreTree(g.analysisTree):parsed.root;
+    const tree=normalizeRuntimeTree(g.analysisTree?restoreTree(g.analysisTree):parsed.root);
     // Keep the parsed headers/result while replacing only the analysis tree.
     parsed.root=tree; if(g.analysisTree)parsed.startFen=tree.fen;
     state.activeGame={...g,parsed};state.currentNode=tree;state.chess=new Chess(tree.fen);state.selectedSquare=null;state.lastMove=null;boardRotated=false;const nextScope=userSide(g)||"all";state.analysisScope=nextScope;if(state.globalTreeSideFilter!==nextScope){state.globalTreeSideFilter=nextScope;state.globalTree=null;state.globalTreeBuiltFor=0;state.globalTreePendingFilter=null;}nav("boardScreen");
@@ -399,7 +392,7 @@ let engineController=null;
 function ensureEngineController(){
   if(engineController)return engineController;
   const makeWorker=()=>{const base=new URL("./stockfish-18-lite-single.js",import.meta.url);base.hash=`${encodeURIComponent(new URL("./stockfish-18-lite-single.wasm",import.meta.url).href)},worker`;return new Worker(base)};
-  engineController=createStockfishController({workerFactory:makeWorker,timeoutMs:20000,depth:16});
+  engineController=createStockfishController({workerFactory:makeWorker,timeoutMs:20000,searchTimeoutMs:7000,depth:16,cacheSize:128,hashMb:32,multiPv:1});
   return engineController;
 }
 async function scheduleEngineAnalysis(fen){
@@ -440,16 +433,16 @@ $("analysisScopeBar")?.querySelectorAll(".analysisScopeTopTab").forEach(b=>b.add
 function setAnalysisScope(side){
   const next=side==="w"||side==="b"?side:"all";
   if(next===state.analysisScope){renderAnalysisScope();return;}
-  state.analysisScope=next;state.globalTreeSideFilter=next;state.analysisScope=next;state.globalTree=null;state.globalTreeBuiltFor=0;state.globalTreePendingFilter=null;
+  state.analysisScope=next;state.globalTreeSideFilter=next;state.globalTree=null;state.globalTreeBuiltFor=0;state.globalTreePendingFilter=null;
   renderAnalysisScope();renderBoard();
   if(!state.globalTreeBuilding)buildGlobalTree();
 }
 const boardRenderer=createBoardRenderer({board:$("board"),renderSquares:renderBoardSquares});
 function renderBoard(){
   const board=$("board");if(!board)return;board.innerHTML="";renderAnalysisScope();
-  if(!state.currentNode){state.currentNode={fen:Chess.START_FEN,children:[],annotations:[],comment:"",note:"",nags:[]};state.chess=new Chess();}
+  if(!state.currentNode){state.currentNode={fen:Chess.START_FEN,children:[],annotations:[],suppressedAnnotations:[],comment:"",note:"",nags:[]};state.chess=new Chess();}
   const {files,ranks}=boardSquares();
-  boardRenderer.render({board,chess:state.chess,currentNode:state.currentNode,selectedSquare:state.selectedSquare,lastMove:state.lastMove,files,ranks,pieceSVG,annotationDef,installPieceFallbacks});
+  boardRenderer.render({board,chess:state.chess,currentNode:state.currentNode,annotations:getEffectiveAnnotations(state.currentNode,state.globalMoveAnnotations),selectedSquare:state.selectedSquare,lastMove:state.lastMove,files,ranks,pieceSVG,annotationDef,installPieceFallbacks});
   const st=state.chess.status();$("position").textContent=st.checkmate?"Échec et mat":st.stalemate?"Pat":`${st.check?"Échec · ":""}Trait aux ${state.chess.turn==="w"?"Blancs":"Noirs"}`;
   $("boardPlayers").textContent=state.activeGame?`${state.activeGame.white||"?"} — ${state.activeGame.black||"?"} · ${state.activeGame.result||"*"}`:"Position initiale · HighTaxi Chess";
   renderMoves();renderAnnotations();renderNav();renderAnalysisMeta();try{renderGlobalTree(state.currentNode.fen)}catch(err){console.warn("Global tree render failed",err)}
@@ -466,7 +459,7 @@ $("board").addEventListener("click",e=>{
       if(existing){gotoNode(existing.id);return}
       saveNoteBeforeNavigation();
       let move=candidates[0];if(candidates.length>1){const promo=(prompt("Promotion : Q, R, B ou N","Q")||"Q").toLowerCase();move=candidates.find(m=>m.promotion===promo)||candidates[0]}
-      const played=state.chess.play(move),node={id:crypto.randomUUID(),parent:state.currentNode,children:[],move,san:played.san,fen:played.fen,annotations:[],comment:"",note:"",clock:null,nags:[]};state.currentNode.children.push(node);state.currentNode=node;state.lastMove=[move.from,move.to];state.selectedSquare=null;schedulePersistAnalysis();renderBoard();onPositionChanged();return;
+      const played=state.chess.play(move),node={id:crypto.randomUUID(),parent:state.currentNode,children:[],move,san:played.san,fen:played.fen,annotations:[],suppressedAnnotations:[],comment:"",note:"",clock:null,nags:[]};state.currentNode.children.push(node);state.currentNode=node;state.lastMove=[move.from,move.to];state.selectedSquare=null;schedulePersistAnalysis();renderBoard();onPositionChanged();return;
     }
   }
   if(state.chess.board[s]&&state.chess.board[s][0]===state.chess.turn){state.selectedSquare=s;renderBoard()}else{state.selectedSquare=null;renderBoard()}
@@ -490,7 +483,7 @@ function renderMoves(){
   renderMovesList({root,currentNode:state.currentNode,esc,moveOutcomeStats,moveGaugeMarkup});
   renderSelectedMoveInsights();
 }
-function renderAnalysisMeta(){const head=$("annotationHeadline"),summary=$("annotationSummary"),icon=$("annotationIcon");const anns=state.currentNode?.annotations||[];const defs=anns.map(annotationDef);if(icon)icon.textContent=defs[defs.length-1]?.icon||"♟";if(head)head.textContent=defs.length?defs.map(d=>d.label).join(" · "):state.currentNode?.san?`${state.currentNode.san} — position analysée`:"Position initiale";if(summary)summary.textContent=state.currentNode?.note?.trim()|| (anns.length?`${anns.map(d=>d.icon).join(" ")} · Annotation enregistrée sur cette position.`:"Ajoute une annotation ou une note à cette position.");}
+function renderAnalysisMeta(){const head=$("annotationHeadline"),summary=$("annotationSummary"),icon=$("annotationIcon");const anns=getEffectiveAnnotations(state.currentNode,state.globalMoveAnnotations);const defs=anns.map(annotationDef);if(icon)icon.textContent=defs[defs.length-1]?.icon||"♟";if(head)head.textContent=defs.length?defs.map(d=>d.label).join(" · "):state.currentNode?.san?`${state.currentNode.san} — position analysée`:"Position initiale";if(summary)summary.textContent=state.currentNode?.note?.trim()|| (anns.length?`${anns.map(d=>d.icon).join(" ")} · Annotation enregistrée sur cette position.`:"Ajoute une annotation ou une note à cette position.");}
 function findNodeByPositionKey(root,key){if(positionKeyFromFen(root?.fen||"")===key)return root;for(const c of root?.children||[]){const found=findNodeByPositionKey(c,key);if(found)return found}return null}
 function currentNodeRoot(){let n=state.currentNode;while(n?.parent)n=n.parent;return n}
 const navigationState={get currentNode(){return state.currentNode},set currentNode(v){state.currentNode=v},get chess(){return state.chess},set chess(v){state.chess=v},get selectedSquare(){return state.selectedSquare},set selectedSquare(v){state.selectedSquare=v},get lastMove(){return state.lastMove},set lastMove(v){state.lastMove=v},chessFactory:fen=>new Chess(fen)};
@@ -508,11 +501,24 @@ $("note")?.addEventListener("input",()=>{clearTimeout(noteSaveTimer);noteSaveTim
 function saveNoteBeforeNavigation(){clearTimeout(noteSaveTimer);saveNoteDraft();}
 
 function renderAnnotations(){
-  const row=$("annotationRow");if(!row)return;row.innerHTML="";const set=new Set(state.currentNode?.annotations||[]);
+  const row=$("annotationRow");if(!row)return;row.innerHTML="";const set=new Set(getEffectiveAnnotations(state.currentNode,state.globalMoveAnnotations));
   ANNOTATION_DEFS.forEach(def=>{const b=document.createElement("button");b.type="button";b.className=`anno ${def.kind} ${set.has(def.icon)?"active":""}`;b.dataset.annotation=def.icon;b.dataset.label=def.label;b.textContent=def.icon;b.title=`${def.icon} · ${def.label}`;b.setAttribute("aria-label",def.label);b.setAttribute("aria-pressed",set.has(def.icon)?"true":"false");b.addEventListener("click",()=>{
-    state.currentNode.annotations=state.currentNode.annotations||[];
-    state.currentNode.annotations=state.currentNode.annotations.includes(def.icon)?state.currentNode.annotations.filter(x=>x!==def.icon):[...state.currentNode.annotations,def.icon];b.setAttribute("aria-pressed",state.currentNode.annotations.includes(def.icon)?"true":"false");
-    if(state.currentNode.parent&&state.currentNode.san){const key=globalMoveKey(state.currentNode.parent.fen,state.currentNode.move);const next=[...state.currentNode.annotations];const counts={good:0,bad:0,neutral:0};next.forEach(x=>counts[annotationKind(x)]++);state.globalMoveAnnotations[key]={annotations:next,kindCounts:counts};saveGlobalMoveAnnotations();}
+    const active=set.has(def.icon);
+    const local=new Set(Array.isArray(state.currentNode.annotations)?state.currentNode.annotations:[]);
+    const suppressed=new Set(Array.isArray(state.currentNode.suppressedAnnotations)?state.currentNode.suppressedAnnotations:[]);
+    const shared=state.currentNode.parent&&state.currentNode.move?new Set(getStoredGlobalAnnotations(state.globalMoveAnnotations,state.currentNode.parent.fen,state.currentNode.move)):new Set();
+    if(active){
+      local.delete(def.icon);
+      if(shared.has(def.icon))suppressed.add(def.icon);
+    }else if(shared.has(def.icon)){
+      suppressed.delete(def.icon);
+      local.delete(def.icon);
+    }else{
+      local.add(def.icon);
+      if(state.currentNode.parent&&state.currentNode.move){setGlobalAnnotation(state.globalMoveAnnotations,state.currentNode.parent.fen,state.currentNode.move,def.icon,true);saveGlobalMoveAnnotations();}
+    }
+    state.currentNode.annotations=[...local];
+    state.currentNode.suppressedAnnotations=[...suppressed];
     renderAnnotations();renderBoard();if(state.activeGame)void persistAnalysis().catch(e=>toast("Enregistrement impossible : "+e.message));
   });row.appendChild(b)});
   const noteEl=$("note");if(noteEl&&document.activeElement!==noteEl)noteEl.value=state.currentNode?.note||"";
@@ -522,14 +528,14 @@ function renderSelectedMoveInsights(){
   const node=state.currentNode;
   if(!node?.move){box.innerHTML='<div class="muted">Sélectionne un coup pour voir ses statistiques.</div>';return}
   const stats=moveOutcomeStats(node),white=stats?.white||0,draw=stats?.draw||0,black=stats?.black||0,total=white+draw+black;
-  const anns=(node.annotations||[]).map(annotationDef);
+  const anns=getEffectiveAnnotations(node,state.globalMoveAnnotations).map(annotationDef);
   box.innerHTML=`<div class="insightMove"><b>${esc(node.san||"—")}</b><span class="muted">${node.parent?.fen===Chess.START_FEN?"Position initiale":"Position sélectionnée"}</span></div>${total?gaugeMarkup(stats,total):'<div class="muted">Pas encore assez de données dans la base pour ce coup.</div>'}<div class="insightAnnotations"><b>Annotations</b><div>${anns.length?anns.map(a=>`<span title="${esc(a.label)}">${esc(a.icon)}</span>`).join(" "):"Aucune"}</div></div>${node.note?.trim()?`<div class="insightNote">${esc(node.note.trim())}</div>`:""}`;
 }
 
 async function persistAnalysisSnapshot(snapshot){if(!snapshot)return;await storageSaveGame(snapshot);state.allGames=state.allGames.map(g=>g.id===snapshot.id?{...snapshot}:g);if(state.activeGame?.id===snapshot.id){state.activeGame={...state.activeGame,analysisTree:snapshot.analysisTree,annotationCount:snapshot.annotationCount,updatedAt:snapshot.updatedAt}}invalidateGlobalTree({rebuild:true});}
 async function persistAnalysis(){if(!state.activeGame||!state.currentNode)return;const root=currentNodeRoot();const stored={...state.activeGame,analysisTree:serializeTree(root),annotationCount:countAnnotations(root),updatedAt:Date.now()};delete stored.parsed;await persistAnalysisSnapshot(stored);}
 function scheduleBackgroundPersist(){if(!state.activeGame||!state.currentNode)return;clearTimeout(persistTimer);persistTimer=setTimeout(()=>{persistTimer=null;void persistAnalysis().then(()=>{renderHome();renderTraining()}).catch(e=>toast("Autosauvegarde impossible : "+e.message));},80)}
-async function flushPendingPersist(){if(!persistTimer)return;clearTimeout(persistTimer);persistTimer=null;await new Promise(resolve=>setTimeout(()=>{void persistAnalysis().finally(resolve)},0));}
+async function flushPendingPersist(){saveNoteBeforeNavigation();if(!persistTimer)return;clearTimeout(persistTimer);persistTimer=null;await new Promise(resolve=>setTimeout(()=>{void persistAnalysis().finally(resolve)},0));}
 function schedulePersistAnalysis(){if(!state.activeGame||!state.currentNode)return;clearTimeout(persistTimer);persistTimer=setTimeout(()=>{persistTimer=null;void persistAnalysis().then(()=>{renderHome();renderTraining()}).catch(e=>toast("Autosauvegarde impossible : "+e.message));},500)}
 $("rotateBoardBtn")?.addEventListener("click",()=>{boardRotated=!boardRotated;renderBoard();});
 $("analysisBackBtn")?.addEventListener("click",()=>{nav(state.activeGame?"games":"home")});
@@ -568,9 +574,9 @@ function exportActiveGamePgn(){
 }
 $("analysisExportBtn")?.addEventListener("click",exportActiveGamePgn);
 
-$("backupBtn").addEventListener("click",async()=>{try{const games=await getAll();const data=JSON.stringify({format:"HighTaxi Chess Backup",version:APP_VERSION,schemaVersion:DATA_SCHEMA_VERSION,exportedAt:new Date().toISOString(),gameCount:games.length,globalMoveAnnotations:state.globalMoveAnnotations,trainingPuzzles:state.trainingPuzzles||[],chessSyncArchives:JSON.parse(localStorage.getItem(CHESS_SYNC_KEY)||"[]"),games});const blob=new Blob([data],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`HighTaxiChess-backup-${new Date().toISOString().slice(0,10)}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),500);toast(`${games.length} partie(s) sauvegardée(s)`)}catch(e){toast("Sauvegarde impossible : "+e.message)}});
+$("backupBtn").addEventListener("click",async()=>{try{const games=await getAll();const data=JSON.stringify({format:"HighTaxi Chess Backup",version:APP_VERSION,schemaVersion:DATA_SCHEMA_VERSION,exportedAt:new Date().toISOString(),gameCount:games.length,globalMoveAnnotations:state.globalMoveAnnotations,trainingPuzzles:state.trainingPuzzles||[],trainingSolvedPositions:state.trainingSolvedPositions||[],chessSyncArchives:JSON.parse(localStorage.getItem(CHESS_SYNC_KEY)||"[]"),games});const blob=new Blob([data],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`HighTaxiChess-backup-${new Date().toISOString().slice(0,10)}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),500);toast(`${games.length} partie(s) sauvegardée(s)`)}catch(e){toast("Sauvegarde impossible : "+e.message)}});
 $("restoreBtn").addEventListener("click",()=>$("backupFile").click());
-$("backupFile").addEventListener("change",async e=>{const f=e.target.files?.[0];if(!f)return;try{const data=JSON.parse(await f.text());if(data.format!=="HighTaxi Chess Backup"||!Array.isArray(data.games))throw new Error("Format de sauvegarde invalide");if(data.schemaVersion&&Number(data.schemaVersion)>DATA_SCHEMA_VERSION)throw new Error("Sauvegarde créée par une version plus récente");const rawGames=data.games.filter(g=>g&&g.id&&typeof g.pgn==="string");if(rawGames.length!==data.games.length)throw new Error("Certaines parties sont invalides");const games=migrateBackupGames(rawGames,Number(data.schemaVersion||1));const importedGlobalAnnotations=data.globalMoveAnnotations&&typeof data.globalMoveAnnotations==="object"?data.globalMoveAnnotations:null;const importedTrainingPuzzles=Array.isArray(data.trainingPuzzles)?data.trainingPuzzles:null;const importedSyncArchives=Array.isArray(data.chessSyncArchives)?data.chessSyncArchives:null;const mode=confirm(`Restaurer ${games.length} partie(s).\n\nOK = remplacer la base actuelle\nAnnuler = fusionner avec la base actuelle`)?"replace":"merge";if(mode==="replace"){if(!confirm("Dernière confirmation : toutes les parties actuellement présentes seront supprimées."))throw new Error("Restauration annulée");await replaceAll(games);if(importedGlobalAnnotations){state.globalMoveAnnotations=importedGlobalAnnotations;saveGlobalMoveAnnotations()}else{state.globalMoveAnnotations={};saveGlobalMoveAnnotations()}if(importedTrainingPuzzles){state.trainingPuzzles=importedTrainingPuzzles;saveTrainingPuzzles()}else{state.trainingPuzzles=[];saveTrainingPuzzles()}if(importedSyncArchives)localStorage.setItem(CHESS_SYNC_KEY,JSON.stringify(importedSyncArchives))}else{const existing=await getAll();const byId=new Map(existing.map(g=>[String(g.id),g]));for(const g of games){const old=byId.get(String(g.id));if(!old||(Number(g.updatedAt||0)>=Number(old.updatedAt||0)))byId.set(String(g.id),g)}await putMany([...byId.values()]);if(importedGlobalAnnotations){state.globalMoveAnnotations={...state.globalMoveAnnotations,...importedGlobalAnnotations};saveGlobalMoveAnnotations()}if(importedTrainingPuzzles){const byKey=new Map((state.trainingPuzzles||[]).map(p=>[trainingPuzzleKey(p),p]));for(const puzzle of importedTrainingPuzzles)byKey.set(trainingPuzzleKey(puzzle),puzzle);state.trainingPuzzles=[...byKey.values()];saveTrainingPuzzles()}if(importedSyncArchives)localStorage.setItem(CHESS_SYNC_KEY,JSON.stringify(importedSyncArchives))}state.allGames=await getAll();invalidateGlobalTree();renderGames();renderPgnCollections();renderHome();renderStats();renderTraining();toast(`${games.length} partie(s) restaurée(s) · ${mode==="replace"?"base remplacée":"base fusionnée"}`)}catch(err){toast("Restauration impossible : "+err.message)}finally{e.target.value=""}});
+$("backupFile").addEventListener("change",async e=>{const f=e.target.files?.[0];if(!f)return;try{const data=JSON.parse(await f.text());const rawGames=validateBackupPayload(data,DATA_SCHEMA_VERSION);const games=migrateBackupGames(rawGames,Number(data.schemaVersion||1));const importedGlobalAnnotations=data.globalMoveAnnotations&&typeof data.globalMoveAnnotations==="object"?data.globalMoveAnnotations:null;const importedTrainingPuzzles=Array.isArray(data.trainingPuzzles)?data.trainingPuzzles:null;const importedTrainingSolved=Array.isArray(data.trainingSolvedPositions)?data.trainingSolvedPositions:null;const importedSyncArchives=Array.isArray(data.chessSyncArchives)?data.chessSyncArchives:null;const mode=confirm(`Restaurer ${games.length} partie(s).\n\nOK = remplacer la base actuelle\nAnnuler = fusionner avec la base actuelle`)?"replace":"merge";if(mode==="replace"){if(!confirm("Dernière confirmation : toutes les parties actuellement présentes seront supprimées."))throw new Error("Restauration annulée");await replaceAll(games);if(importedGlobalAnnotations){state.globalMoveAnnotations=importedGlobalAnnotations;saveGlobalMoveAnnotations()}else{state.globalMoveAnnotations={};saveGlobalMoveAnnotations()}if(importedTrainingPuzzles){state.trainingPuzzles=importedTrainingPuzzles;saveTrainingPuzzles()}else{state.trainingPuzzles=[];saveTrainingPuzzles()}if(importedTrainingSolved){state.trainingSolvedPositions=[...new Set(importedTrainingSolved.map(String))];saveTrainingSolvedPositions()}else{state.trainingSolvedPositions=[];saveTrainingSolvedPositions()}if(importedSyncArchives)localStorage.setItem(CHESS_SYNC_KEY,JSON.stringify(importedSyncArchives));else localStorage.removeItem(CHESS_SYNC_KEY)}else{const existing=await getAll();const byId=new Map(existing.map(g=>[String(g.id),g]));for(const g of games){const old=byId.get(String(g.id));if(!old||(Number(g.updatedAt||0)>=Number(old.updatedAt||0)))byId.set(String(g.id),g)}await putMany([...byId.values()]);if(importedGlobalAnnotations){state.globalMoveAnnotations=mergeGlobalAnnotations(state.globalMoveAnnotations,importedGlobalAnnotations);saveGlobalMoveAnnotations()}if(importedTrainingPuzzles){const byKey=new Map((state.trainingPuzzles||[]).map(p=>[trainingPuzzleKey(p),p]));for(const puzzle of importedTrainingPuzzles)byKey.set(trainingPuzzleKey(puzzle),puzzle);state.trainingPuzzles=[...byKey.values()];saveTrainingPuzzles()}if(importedTrainingSolved){state.trainingSolvedPositions=[...new Set([...(state.trainingSolvedPositions||[]),...importedTrainingSolved.map(String)])];saveTrainingSolvedPositions()}if(importedSyncArchives)localStorage.setItem(CHESS_SYNC_KEY,JSON.stringify(importedSyncArchives))}indexPersistedAnnotations(games);state.allGames=await getAll();invalidateGlobalTree();renderGames();renderPgnCollections();renderHome();renderStats();renderTraining();toast(`${games.length} partie(s) restaurée(s) · ${mode==="replace"?"base remplacée":"base fusionnée"}`)}catch(err){toast("Restauration impossible : "+err.message)}finally{e.target.value=""}});
 
 $("syncBtn").addEventListener("click",async()=>{
   const b=$("syncBtn"),progress=$("syncProgress"),wrap=$("syncProgressWrap"),label=$("syncProgressText");
@@ -621,10 +627,10 @@ $("syncBtn").addEventListener("click",async()=>{
         }catch{invalid++;monthInvalid++;continue}
         fetched++;
         const pgn=String(raw).trim();
-        const id=gameIdentity("Chess.com",parsed,h);
+        const id=chessComStableId({url:h.Link||"",uuid:h.UUID||""},pgn);
         if(existing.has(id))continue;
         const result=String(h.Result||"*").trim();
-        const g=metaFromHeaders({...h,Result:["1-0","0-1","1/2-1/2","*"].includes(result)?result:"*"},"Chess.com",parseTimestamp(h,0),pgn,{id,eco:openingName(h.ECO||""),time_control:h.TimeControl||"",chessArchive:monthKey,url:archiveUrl});
+        const g=metaFromHeaders({...h,Result:["1-0","0-1","1/2-1/2","*"].includes(result)?result:"*"},"Chess.com",parseTimestamp(h,0),pgn,{id,eco:openingName(h.ECO||""),time_control:h.TimeControl||"",chessArchive:monthKey,url:h.Link||archiveUrl,chessComUrl:h.Link||null});
         batchAdds.push(g);existing.add(id);
       }
       if(batchAdds.length){await putMany(batchAdds);added+=batchAdds.length;state.allGames.push(...batchAdds)}
@@ -650,21 +656,21 @@ $("settingsBtn").addEventListener("click",async()=>{const panel=$("settingsPanel
 $("settingsClose")?.addEventListener("click",()=>{const p=$("settingsPanel");p?.classList.remove("open");p?.setAttribute("aria-hidden","true")});
 $("settingsPanel")?.addEventListener("click",e=>{if(e.target.id==="settingsPanel")$("settingsClose")?.click()});
 async function renderSettings(){const est=await getStorageEstimate();const account=$("settingsAccount");if(account)account.value=currentUser();$("settingsVersion")?.replaceChildren(document.createTextNode(APP_VERSION));$("settingsStorage")?.replaceChildren(document.createTextNode(est?.usage?`${(est.usage/1024/1024).toFixed(1)} Mo utilisés`:"Indisponible"));["autoEngine","showArrows","compactMoves"].forEach(k=>{const el=$("setting_"+k);if(el)el.checked=!!state.appSettings[k]});}
-$("settingsAccount")?.addEventListener("change",e=>{const value=String(e.target.value||"").trim();if(!value){e.target.value=currentUser();return}state.appSettings.chesscomUser=value;saveAppSettings();renderHome();toast(`Compte Chess.com : ${value}`)});
+$("settingsAccount")?.addEventListener("change",e=>{const value=String(e.target.value||"").trim();if(!value){e.target.value=currentUser();return}if(value.toLowerCase()===currentUser().toLowerCase()){e.target.value=currentUser();return}try{engineController?.cancel()}catch{}trainingController.stop();trainingUI.end();clearArrowCache();recreatedPgnCache.clear();localStorage.removeItem(CHESS_SYNC_KEY);localStorage.removeItem(CHESS_SYNC_STATUS_KEY);state.appSettings.chesscomUser=value;saveAppSettings();resetUserScopedState(state);state.chess=new Chess();engineController?.clearCache?.();renderHome();renderGames();renderPgnCollections();renderStats();renderTraining();if(document.body.classList.contains("analysisActive"))renderBoard();renderSyncStatus();toast(`Compte Chess.com : ${value}`)});
 ["autoEngine","showArrows","compactMoves"].forEach(k=>$("setting_"+k)?.addEventListener("change",e=>{state.appSettings[k]=e.target.checked;saveAppSettings();if(k==="showArrows")renderBoard();if(k==="compactMoves")document.body.classList.toggle("compactMoves",!!state.appSettings.compactMoves);if(k==="autoEngine"){if(state.appSettings.autoEngine)onPositionChanged();else cancelEngineAnalysis("Analyse Stockfish désactivée.")}}));
 $("settingsRebuild")?.addEventListener("click",()=>{invalidateGlobalTree();if(document.body.classList.contains("analysisActive"))buildGlobalTree();toast("Arbre global en reconstruction")});
 $("settingsEngineReset")?.addEventListener("click",()=>{state.engineSearchToken++;engineController?.dispose();engineController=null;state.engineUnavailable=false;if(state.appSettings.autoEngine)onPositionChanged();toast("Stockfish réinitialisé")});
-$("settingsClearCaches")?.addEventListener("click",()=>{recreatedPgnCache.clear();openingPrefixCache.clear();state.trainingCache=[];state.trainingCacheRevision=-1;invalidateGlobalTree();toast("Caches locaux vidés")});
+$("settingsClearCaches")?.addEventListener("click",()=>{recreatedPgnCache.clear();clearOpeningPrefixCache();clearArrowCache();engineController?.clearCache?.();state.trainingCache=[];state.trainingCacheRevision=-1;invalidateGlobalTree();toast("Caches locaux vidés")});
 $("trainingScanBtn")?.addEventListener("click",()=>void trainingController.scan());
 $("trainingStopBtn")?.addEventListener("click",()=>trainingController.stop());
 $("trainingExportBtn")?.addEventListener("click",()=>trainingController.exportFile());
-$("trainingClearBtn")?.addEventListener("click",()=>trainingController.clear());
+$("trainingClearBtn")?.addEventListener("click",()=>{trainingUI.end();trainingController.clear();});
 
 async function boot(){
   await runBoot({
     migrate:async()=>{await migrateStorage();await migrateChessComStableIds();keepStoragePersistent().catch(()=>{});},
     load:storageLoadGames,
-    onLoaded:async games=>{state.allGames=games||[];renderHome();renderGames();renderStats();renderTraining();renderSyncStatus();installBoardResizeObserver();document.body.classList.toggle("compactMoves",!!state.appSettings.compactMoves);renderBoard();const hash=location.hash;if(hash==="#board"||hash==="#games")nav(hash.slice(1)==="board"?"boardScreen":"games");else nav("boardScreen");},
+    onLoaded:async games=>{state.allGames=games||[];indexPersistedAnnotations(state.allGames);renderHome();renderGames();renderStats();renderTraining();renderSyncStatus();installBoardResizeObserver();document.body.classList.toggle("compactMoves",!!state.appSettings.compactMoves);renderBoard();const hash=location.hash;if(hash==="#board"||hash==="#games")nav(hash.slice(1)==="board"?"boardScreen":"games");else nav("boardScreen");},
     onError:error=>{toast("Erreur de stockage : "+error.message);renderBoard();}
   });
 }
